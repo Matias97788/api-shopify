@@ -122,7 +122,12 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
       for (const v of variants) {
         const sku = (v?.sku || '').trim();
         if (!sku) continue;
-        skuEntries.push({ sku, product_name: productName, shopify_stock: v.inventory_quantity ?? null });
+        skuEntries.push({ 
+          sku, 
+          product_name: productName, 
+          shopify_stock: v.inventory_quantity ?? null,
+          shopify_bodegas: v.inventory_levels || []
+        });
       }
     }
 
@@ -149,7 +154,7 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
     async function runBatch() {
       const batch = skuEntries.slice(index, index + concurrency);
       index += concurrency;
-      await Promise.all(batch.map(async ({ sku, product_name, shopify_stock }) => {
+      await Promise.all(batch.map(async ({ sku, product_name, shopify_stock, shopify_bodegas }) => {
         try {
           const extData = await queryExternal(sku);
           const rows = Array.isArray(extData) ? extData : [];
@@ -158,7 +163,8 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
             producto: sku,
             stock_real: Number(row?.stock_real ?? 0),
             product_name,
-            shopify_stock
+            shopify_stock,
+            shopify_bodegas
           }));
           if (augmented.length === 0) {
             // Asegura que se muestre la bodega (null) y stock_real 0
@@ -167,7 +173,8 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
               producto: sku,
               stock_real: 0,
               product_name,
-              shopify_stock
+              shopify_stock,
+              shopify_bodegas
             });
           } else {
             results.push(...augmented);
@@ -180,7 +187,8 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
             producto: sku,
             stock_real: 0,
             product_name,
-            shopify_stock
+            shopify_stock,
+            shopify_bodegas
           });
         }
       }));
@@ -202,6 +210,7 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
             sku,
             product_name: row.product_name,
             shopify_stock: row.shopify_stock,
+            shopify_bodegas: row.shopify_bodegas || [],
             _bodegas: new Map()
           });
         }
@@ -213,6 +222,7 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
         sku: e.sku,
         product_name: e.product_name,
         shopify_stock: e.shopify_stock,
+        shopify_bodegas: e.shopify_bodegas,
         bodegas: Array.from(e._bodegas.entries()).map(([bodega, stock_real]) => ({ bodega, stock_real }))
       }));
       logger.info('[HTTP] /obtenerporductosbasecruz success (group=sku)', { id: req.requestId, skus_count: skuEntries.length, groups: grouped.length, next_page_info });

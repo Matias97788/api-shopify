@@ -42,6 +42,7 @@ axios.interceptors.response.use(
 );
 
 const API_VERSION = '2024-10';
+let locationsCache = null; // Map<location_id, location_name>
 
 function getEnv(name) {
   const v = process.env[name];
@@ -97,7 +98,147 @@ export async function obtenerProductos({ limit = 50, page_info } = {}) {
     }
   }
 
+  // Enriquecer con niveles de inventario por location
+  try {
+    if (products.length > 0 && products[0].variants.length > 0) {
+      logger.debug(`[Shopify] First variant debug: ${JSON.stringify(products[0].variants[0])}`);
+    }
+
+    const inventoryItemIds = products
+      .flatMap(p => p.variants)
+      .map(v => v.inventory_item_id)
+      .filter(Boolean);
+
+    if (inventoryItemIds.length > 0) {
+       logger.debug(`[Shopify] Fetching inventory for ${inventoryItemIds.length} items`);
+       
+       // Obtener mapa de ubicaciones para enriquecer con nombres
+       const locationsMap = await obtenerMapaUbicaciones();
+       
+       const levelsMap = await obtenerNivelesInventario(inventoryItemIds);
+       logger.debug(`[Shopify] Fetched levels for ${levelsMap.size} items`);
+       
+       // Asignar niveles a cada variante
+       for (const p of products) {
+         for (const v of p.variants) {
+            const hasIt = levelsMap.has(v.inventory_item_id);
+            if (v.inventory_item_id && hasIt) {
+             const rawLevels = levelsMap.get(v.inventory_item_id);
+             v.inventory_levels = rawLevels.map(lvl => ({
+               ...lvl,
+               location_name: locationsMap.get(lvl.location_id) || `Location ${lvl.location_id}`
+             }));
+           } else {
+             v.inventory_levels = [];
+           }
+         }
+       }
+    }
+  } catch (err) {
+    logger.error(`[Shopify] Error fetching inventory levels: ${err.message}`);
+    // No fallamos todo el request, solo logueamos y seguimos sin el detalle
+  }
+
   return { products, raw: resp.data, next_page_info };
+}
+
+// Obtiene niveles de inventario para una lista de inventory_item_ids
+async function obtenerNivelesInventario(inventoryItemIds) {
+  const domain = getEnv('SHOPIFY_STORE_DOMAIN');
+  const token = getEnv('SHOPIFY_ADMIN_TOKEN');
+  
+  // Shopify permite filtrar por inventory_item_ids (lista separada por comas)
+  // Se recomienda hacer batches si son muchos. El límite suele ser 50 IDs por request.
+  const uniqueIds = [...new Set(inventoryItemIds)];
+  const chunkSize = 50;
+  const chunks = [];
+  
+  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+    chunks.push(uniqueIds.slice(i, i + chunkSize));
+  }
+
+  const levelsMap = new Map(); // inventory_item_id -> array of levels
+
+  for (const chunk of chunks) {
+    const idsParam = chunk.join(',');
+    let nextUrl = `https://${domain}/admin/api/${API_VERSION}/inventory_levels.json?inventory_item_ids=${idsParam}&limit=250`;
+    
+    while (nextUrl) {
+        try {
+          const resp = await axios.get(nextUrl, {
+            headers: {
+              'X-Shopify-Access-Token': token,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            }
+          });
+          
+          const levels = resp.data?.inventory_levels || [];
+          for (const level of levels) {
+            const itemId = level.inventory_item_id;
+            if (!levelsMap.has(itemId)) {
+              levelsMap.set(itemId, []);
+            }
+            levelsMap.get(itemId).push({
+              location_id: level.location_id,
+              available: level.available
+            });
+          }
+
+          // Handle pagination
+          const linkHeader = resp.headers?.link || resp.headers?.Link;
+          let foundNext = false;
+          if (linkHeader) {
+            const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/i);
+            if (match && match[1]) {
+              nextUrl = match[1];
+              foundNext = true;
+            }
+          }
+          
+          if (!foundNext) {
+            nextUrl = null;
+          }
+
+        } catch (e) {
+          logger.error(`[Shopify] Error fetching inventory chunk: ${e.message}`);
+          nextUrl = null; // Stop this chunk on error
+        }
+    }
+  }
+  
+  return levelsMap;
+}
+
+// Obtiene lista de ubicaciones y cachea el resultado
+async function obtenerMapaUbicaciones() {
+  if (locationsCache) return locationsCache;
+
+  const domain = getEnv('SHOPIFY_STORE_DOMAIN');
+  const token = getEnv('SHOPIFY_ADMIN_TOKEN');
+  const url = `https://${domain}/admin/api/${API_VERSION}/locations.json`;
+
+  try {
+    const resp = await axios.get(url, {
+      headers: {
+        'X-Shopify-Access-Token': token,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
+    });
+    
+    const locations = resp.data?.locations || [];
+    const map = new Map();
+    for (const loc of locations) {
+      map.set(loc.id, loc.name);
+    }
+    locationsCache = map;
+    logger.info(`[Shopify] Ubicaciones cargadas: ${map.size}`);
+    return map;
+  } catch (e) {
+    logger.error(`[Shopify] Error fetching locations: ${e.message}`);
+    return new Map();
+  }
 }
 
 // Obtiene datos de una variante por ID (incluye inventory_item_id y inventory_quantity)
@@ -183,16 +324,22 @@ export async function obtenerInventoryItemIdDeVariante(variantId) {
 }
 
 // Setea el stock (available) de un inventory_item_id en una o varias locations (separadas por coma)
-export async function establecerNivelInventario({ inventory_item_id, available }) {
+export async function establecerNivelInventario({ inventory_item_id, available, location_id: specificLocationId }) {
   const domain = getEnv('SHOPIFY_STORE_DOMAIN');
   const token = getEnv('SHOPIFY_ADMIN_TOKEN');
-  const locationEnv = getEnv('SHOPIFY_LOCATION_ID');
+  
+  let locationIds = [];
 
-  // Soporte para múltiples locations separadas por coma
-  const locationIds = locationEnv.split(',').map(s => s.trim()).filter(Boolean);
+  if (specificLocationId) {
+    locationIds = [specificLocationId];
+  } else {
+    const locationEnv = getEnv('SHOPIFY_LOCATION_ID');
+    // Soporte para múltiples locations separadas por coma
+    locationIds = locationEnv.split(',').map(s => s.trim()).filter(Boolean);
+  }
 
   if (locationIds.length === 0) {
-    throw new Error('SHOPIFY_LOCATION_ID no contiene ningún ID válido');
+    throw new Error('No se especificó location_id y SHOPIFY_LOCATION_ID no contiene ningún ID válido');
   }
 
   const results = [];
@@ -227,31 +374,119 @@ export async function establecerNivelInventario({ inventory_item_id, available }
   return { updated: results, errors };
 }
 
-// Actualiza stock para uno o varios items: { inventory_item_id | variant_id, available }
+// Actualiza stock para uno o varios items: { inventory_item_id | variant_id, available, location_id?, location_name? }
 export async function actualizarStock(updates) {
   const items = Array.isArray(updates) ? updates : [updates];
 
   const results = [];
+  // Use sequential processing to be safe with rate limits, or batch with limit.
+  // Given user request "batch processing", sequential is fine but let's robustify.
   for (const item of items) {
     const { available } = item;
     if (available === undefined || available === null) {
-      throw new Error('Cada item debe incluir "available"');
+       results.push({ ok: false, error: 'Cada item debe incluir "available"', item });
+       continue;
     }
 
     let inventory_item_id = item.inventory_item_id;
-    if (!inventory_item_id && item.variant_id) {
-      inventory_item_id = await obtenerInventoryItemIdDeVariante(item.variant_id);
+
+    // Resolve ID if missing
+    if (!inventory_item_id) {
+        try {
+            if (item.variant_id) {
+                inventory_item_id = await obtenerInventoryItemIdDeVariante(item.variant_id);
+            } else if (item.sku) {
+                inventory_item_id = await obtenerInventoryItemIdPorSku(item.sku);
+            }
+        } catch (e) {
+            results.push({ ok: false, error: e.message, item });
+            continue;
+        }
     }
 
     if (!inventory_item_id) {
-      throw new Error('Se requiere inventory_item_id o variant_id por item');
+       results.push({ ok: false, error: 'Could not resolve inventory_item_id from variant_id or sku', item });
+       continue;
     }
 
-    const data = await establecerNivelInventario({ inventory_item_id, available });
-    results.push({ ok: true, inventory_item_id, available, data });
+    // Resolver location
+    let targetLocationId = item.location_id;
+    if (!targetLocationId && item.location_name) {
+        const map = await obtenerMapaUbicaciones();
+        // Buscar location_id por nombre (case insensitive)
+        const normalizedName = item.location_name.toLowerCase().trim();
+        for (const [id, name] of map.entries()) {
+           if (name.toLowerCase().trim() === normalizedName) {
+             targetLocationId = id;
+             break;
+           }
+        }
+        if (!targetLocationId) {
+             results.push({ ok: false, error: `Location '${item.location_name}' not found` });
+             continue;
+        }
+    }
+
+    if (!targetLocationId) {
+        results.push({ ok: false, error: 'Missing location_id or valid location_name' });
+        continue;
+    }
+
+    try {
+      const data = await establecerNivelInventario({ inventory_item_id, available, location_id: targetLocationId });
+      results.push({ ok: true, inventory_item_id, available, location_id: targetLocationId, data });
+    } catch (e) {
+      results.push({ ok: false, error: e.message, inventory_item_id });
+    }
   }
 
   return { ok: true, count: results.length, results };
+}
+
+// Resuelve SKU a InventoryItemId usando GraphQL
+async function obtenerInventoryItemIdPorSku(sku) {
+  const domain = getEnv('SHOPIFY_STORE_DOMAIN');
+  const token = getEnv('SHOPIFY_ADMIN_TOKEN');
+
+  const query = `
+    query($query: String!) {
+      productVariants(first: 1, query: $query) {
+        edges {
+          node {
+            inventoryItem {
+              id
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const resp = await axios.post(
+      `https://${domain}/admin/api/${API_VERSION}/graphql.json`,
+      {
+        query,
+        variables: { query: `sku:${sku}` }
+      },
+      {
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const edges = resp.data?.data?.productVariants?.edges;
+    if (edges && edges.length > 0) {
+      const gid = edges[0].node.inventoryItem.id; // gid://shopify/InventoryItem/123456
+      return gid.split('/').pop();
+    }
+    return null;
+  } catch (e) {
+    logger.error(`[Shopify] Error resolving SKU ${sku}: ${e.message}`);
+    return null;
+  }
 }
 
 // Actualiza el precio de una variante por variant_id
