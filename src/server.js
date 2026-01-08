@@ -106,8 +106,22 @@ app.get('/products', async (req, res) => {
   }
 });
 
-// Consulta /products para obtener un SKU y luego consulta API externa con ese SKU
-app.get('/obtenerporductosbasecruz', async (req, res) => {
+const BODEGA_NAMES = {
+      10: 'Flotaservicio Los Ángeles',
+      14: 'Serviteca Los Ángeles',
+      20: 'Talca',
+      24: 'Curicó',
+      30: 'Chillán',
+      40: 'Concepción - Talcahuano',
+      50: 'Temuco',
+      55: 'Valdivia',
+      60: 'Osorno',
+      70: 'Santiago',
+      75: 'Vitacura'
+    };
+
+    // Consulta /products para obtener un SKU y luego consulta API externa con ese SKU
+    app.get('/obtenerporductosbasecruz', async (req, res) => {
   try {
     // Usa el cliente directo a Shopify para obtener productos con paginación
     const { limit, page_info } = req.query || {};
@@ -135,7 +149,7 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
       return res.json({ success: true, next_page_info, data: [] });
     }
 
-    const apiKey = process.env.EXTERNAL_API_KEY || 'ee6c121ec6fe849dc2686b00d8f132a92873ac9d572e20f208190b6232d976c6';
+    const apiKey = process.env.EXTERNAL_API_KEY || 'e6c121ec6fe849dc2686b00d8f132a92873ac9d572e20f208190b6232d976c6';
     const externalUrl = process.env.EXTERNAL_STOCK_URL || 'http://192.168.3.172:3000/api/query';
 
     // Función para consultar API externa por SKU
@@ -158,8 +172,11 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
         try {
           const extData = await queryExternal(sku);
           const rows = Array.isArray(extData) ? extData : [];
-          const augmented = rows.map(row => ({
+          const augmented = rows
+            .filter(row => row?.bodega != 18)
+            .map(row => ({
             bodega: row?.bodega ?? null,
+            nombre_bodega: BODEGA_NAMES[row?.bodega] || null,
             producto: sku,
             stock_real: Number(row?.stock_real ?? 0),
             product_name,
@@ -223,7 +240,11 @@ app.get('/obtenerporductosbasecruz', async (req, res) => {
         product_name: e.product_name,
         shopify_stock: e.shopify_stock,
         shopify_bodegas: e.shopify_bodegas,
-        bodegas: Array.from(e._bodegas.entries()).map(([bodega, stock_real]) => ({ bodega, stock_real }))
+        bodegas: Array.from(e._bodegas.entries()).map(([bodega, stock_real]) => ({
+          bodega,
+          nombre_bodega: BODEGA_NAMES[bodega] || null,
+          stock_real
+        }))
       }));
       logger.info('[HTTP] /obtenerporductosbasecruz success (group=sku)', { id: req.requestId, skus_count: skuEntries.length, groups: grouped.length, next_page_info });
       return res.json({ success: true, next_page_info, data: grouped });
